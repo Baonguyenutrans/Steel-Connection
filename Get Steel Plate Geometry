@@ -1,0 +1,79 @@
+import clr
+clr.AddReference('ProtoGeometry')
+from Autodesk.DesignScript.Geometry import *
+
+import sys
+import os
+import webbrowser
+import unicodedata
+
+# Revit and Dynamo references
+clr.AddReference('RevitAPI')
+clr.AddReference('RevitAPISteel')
+clr.AddReference('RevitAPIUI')
+clr.AddReference('RevitNodes')
+clr.AddReference('RevitServices')
+clr.AddReference('DSCoreNodes')
+
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.UI import Selection
+from RevitServices.Persistence import DocumentManager
+from RevitServices.Transactions import TransactionManager
+from DSCore import *
+import Revit
+clr.ImportExtensions(Revit.Elements)
+clr.ImportExtensions(Revit.GeometryConversion)
+
+# ---------------------------------------------------------------------
+# Current Revit Document and View
+# ---------------------------------------------------------------------
+doc = DocumentManager.Instance.CurrentDBDocument
+uidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument
+view = doc.ActiveView
+
+# ---------------------------------------------------------------------
+# Input: Selected Structural Connection Plate element
+# ---------------------------------------------------------------------
+connection = UnwrapElement(IN[0])
+
+# ---------------------------------------------------------------------
+# Geometry extraction options
+# ---------------------------------------------------------------------
+opt = Options()
+opt.ComputeReferences = True
+opt.IncludeNonVisibleObjects = True
+opt.View = view
+
+# ---------------------------------------------------------------------
+# Extract geometry (including nested instances)
+# ---------------------------------------------------------------------
+def get_geometry(element, options):
+    """Recursively extract solids from the element geometry."""
+    solids = []
+    geo_element = element.get_Geometry(options)
+    if not geo_element:
+        return solids
+    
+    for geomObj in geo_element:
+        # Handle solid geometry
+        if isinstance(geomObj, Solid) and geomObj.Volume > 0:
+            solids.append(geomObj.ToProtoType())
+        # Handle nested geometry (e.g., in steel connections)
+        elif isinstance(geomObj, GeometryInstance):
+            inst_geo = geomObj.GetInstanceGeometry()
+            for g in inst_geo:
+                if isinstance(g, Solid) and g.Volume > 0:
+                    solids.append(g.ToProtoType())
+    return solids
+
+# ---------------------------------------------------------------------
+# Run geometry extraction
+# ---------------------------------------------------------------------
+TransactionManager.Instance.EnsureInTransaction(doc)
+geometry = get_geometry(connection, opt)
+TransactionManager.Instance.TransactionTaskDone()
+
+# ---------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------
+OUT = geometry
