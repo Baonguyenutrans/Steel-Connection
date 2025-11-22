@@ -25,7 +25,7 @@ clr.AddReference('System.Drawing')
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.UI import *
 from Autodesk.Revit.UI.Selection import *
-from System.Windows.Forms import MessageBox, Form, Label, TextBox, Button, FormStartPosition, DialogResult
+from System.Windows.Forms import MessageBox, Form, Label, TextBox, Button, FormStartPosition, DialogResult, CheckBox
 from System.Drawing import Point, Size, Color
 
 # Conversion factor: feet to internal units (feet already in Revit, but this helps)
@@ -112,6 +112,21 @@ def get_reversed_curve(curve):
         end = curve.GetEndPoint(0)
         return Line.CreateBound(start, end)
 
+def reverse_two_shortest_edges(edge1, edge2):
+    """
+    Reverse both shortest edges and optionally swap their order.
+    
+    Args:
+        edge1: First shortest edge (curve)
+        edge2: Second shortest edge (curve)
+    
+    Returns:
+        Tuple of (reversed_edge1, reversed_edge2)
+    """
+    reversed_edge1 = get_reversed_curve(edge1)
+    reversed_edge2 = get_reversed_curve(edge2)
+    return (reversed_edge1, reversed_edge2)
+
 def create_face_based_family_instance(doc, face_ref, location_point, family_type):
     """
     Create a face-based family instance on the given face reference.
@@ -153,7 +168,7 @@ def create_face_based_family_instance(doc, face_ref, location_point, family_type
             print("Error creating family instance: {}\nTried alternative: {}".format(str(e), str(e2)))
             return None
 
-def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, offset_distance, num_rows=1, row_spacing=0.0):
+def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, offset_distance, num_rows=1, row_spacing=0.0, use_reversed_curves=False):
     """
     Place face-based bolts on a face based on the Dynamo logic.
     
@@ -166,6 +181,7 @@ def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, of
         offset_distance: Offset distance in feet from curve start
         num_rows: Number of rows of bolts to place (default: 1)
         row_spacing: Spacing between rows in feet (default: 0.0, uses distance between line1 and line2)
+        use_reversed_curves: If True, use reversed curves instead of original (default: False)
     
     Returns:
         List of created family instances
@@ -249,25 +265,48 @@ def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, of
         t4 = sorted_curves[0]  # Shortest edge
         t5 = sorted_curves[1]  # Second shortest edge
         
+        # Reverse both shortest edges using the function (for later use)
+        t4_reversed, t5_reversed = reverse_two_shortest_edges(t4, t5)
+        
+        # Choose whether to use original or reversed curves based on user preference
+        # Original (unchecked): t4 (original), t5_reversed - works correctly
+        # Reversed (checked): t4_reversed, t5 (original) - swaps which edge is reversed
+        # This keeps reference lines parallel and vertical in both cases
+        if use_reversed_curves:
+            # Swap which edge is reversed: use t4_reversed and t5 (original)
+            # This maintains the same pattern as original but swaps the orientation
+            curves1 = t4_reversed  # Reversed shortest edge
+            curves2 = t5  # Original second shortest edge (not reversed)
+        else:
+            # Original logic: first edge original, second edge reversed
+            curves1 = t4  # Original shortest edge
+            curves2 = t5_reversed  # Reversed second shortest edge
+        
         # Get points at specified length along the SHORTEST edges (t12 in Dynamo)
         # These points will be on the shortest edges
-        curves1 = t4  # Shortest edge
-        point1 = get_point_at_length(curves1, offset_distance)  # Point on shortest edge
+        point1 = get_point_at_length(curves1, offset_distance)  # Point on first edge
         
-        # Use second shortest edge (or parallel shortest edge for rectangles)
-        curve_rev_t5 = get_reversed_curve(t5)  # Reverse the second shortest edge
-        curves2 = curve_rev_t5
-        point2 = get_point_at_length(curves2, offset_distance)  # Point on second shortest edge
+        # Get point on second edge
+        point2 = get_point_at_length(curves2, offset_distance)  # Point on second edge
         
         # Create line between points (line1 in Dynamo)
+        # This line should be vertical/parallel in both cases
         line1 = Line.CreateBound(point1, point2)
         
-        # Reverse first curve and get point
-        curve2 = get_reversed_curve(curves1)
-        point3 = get_point_at_length(curve2, offset_distance)
+        # Get points for second line (for second row of bolts)
+        # For line2, we reverse curves1 and get the opposite of curves2
+        # This ensures line1 and line2 are parallel and don't cross
+        if use_reversed_curves:
+            # For reversed option: reverse t4_reversed = t4, and reverse t5 = t5_reversed
+            # This swaps back to the opposite orientation for line2
+            curve2 = get_reversed_curve(curves1)  # Reverse t4_reversed = t4 (original)
+            curve3 = get_reversed_curve(curves2)  # Reverse t5 = t5_reversed
+        else:
+            # Original logic: reverse first edge for second line
+            curve2 = t4_reversed  # Reversed shortest edge
+            curve3 = get_reversed_curve(curves2)  # Reverse t5_reversed back = t5 (original)
         
-        # Reverse the reversed second curve (back to original direction)
-        curve3 = get_reversed_curve(curves2)
+        point3 = get_point_at_length(curve2, offset_distance)
         point4 = get_point_at_length(curve3, offset_distance)
         
         # Create second line (line2 in Dynamo)
@@ -392,7 +431,7 @@ def load_preferences():
         print("Error loading preferences: {}".format(str(e)))
     return None
 
-def save_preferences(family_type_name, spacing_values, offset_distance, num_rows, row_spacing):
+def save_preferences(family_type_name, spacing_values, offset_distance, num_rows, row_spacing, use_reversed_curves):
     """Save preferences to JSON file"""
     if json is None:
         return  # Skip saving if json is not available
@@ -403,7 +442,8 @@ def save_preferences(family_type_name, spacing_values, offset_distance, num_rows
             'spacing_values': spacing_values,
             'offset_distance': offset_distance,
             'num_rows': num_rows,
-            'row_spacing': row_spacing
+            'row_spacing': row_spacing,
+            'use_reversed_curves': use_reversed_curves
         }
         prefs_path = get_preferences_file_path()
         with open(prefs_path, 'w') as f:
@@ -416,7 +456,7 @@ class BoltPlacementForm(Form):
     def __init__(self):
         self.Text = "Place Face-Based Bolts"
         self.Width = 450
-        self.Height = 450  # Increased height for new fields
+        self.Height = 490  # Increased height for checkbox field
         self.StartPosition = FormStartPosition.CenterScreen
         
         # Load previous preferences or use defaults
@@ -427,6 +467,7 @@ class BoltPlacementForm(Form):
             self.offset_distance = prefs.get('offset_distance', 0.0)
             self.num_rows = prefs.get('num_rows', 1)
             self.row_spacing = prefs.get('row_spacing', 0.0)
+            self.use_reversed_curves = prefs.get('use_reversed_curves', False)
         else:
             # Default values
             self.family_type_name = "EAB_Face-Based_Bolt_D1"
@@ -434,6 +475,7 @@ class BoltPlacementForm(Form):
             self.offset_distance = 0.0  # in inches
             self.num_rows = 1  # Number of rows
             self.row_spacing = 0.0  # Row spacing in inches (0 = auto/evenly spaced)
+            self.use_reversed_curves = False  # Use original curves by default
         
         # Family type label and input
         lbl_family = Label()
@@ -500,10 +542,18 @@ class BoltPlacementForm(Form):
         self.txt_row_spacing.Size = Size(150, 22)
         self.Controls.Add(self.txt_row_spacing)
         
+        # Use reversed curves checkbox
+        self.chk_reversed = CheckBox()
+        self.chk_reversed.Text = "Use reversed curves"
+        self.chk_reversed.Location = Point(10, 275)
+        self.chk_reversed.Size = Size(300, 20)
+        self.chk_reversed.Checked = self.use_reversed_curves
+        self.Controls.Add(self.chk_reversed)
+        
         # Info label
         lbl_info = Label()
         lbl_info.Text = "Note: Select a face in Revit after clicking OK"
-        lbl_info.Location = Point(10, 275)
+        lbl_info.Location = Point(10, 300)
         lbl_info.Size = Size(400, 40)
         lbl_info.ForeColor = Color.DarkGray
         self.Controls.Add(lbl_info)
@@ -511,7 +561,7 @@ class BoltPlacementForm(Form):
         # OK button
         self.btn_ok = Button()
         self.btn_ok.Text = "OK"
-        self.btn_ok.Location = Point(240, 340)
+        self.btn_ok.Location = Point(240, 365)
         self.btn_ok.Size = Size(80, 30)
         self.btn_ok.Click += self.on_ok
         self.Controls.Add(self.btn_ok)
@@ -519,7 +569,7 @@ class BoltPlacementForm(Form):
         # Cancel button
         self.btn_cancel = Button()
         self.btn_cancel.Text = "Cancel"
-        self.btn_cancel.Location = Point(330, 340)
+        self.btn_cancel.Location = Point(330, 365)
         self.btn_cancel.Size = Size(80, 30)
         self.btn_cancel.Click += self.on_cancel
         self.Controls.Add(self.btn_cancel)
@@ -552,13 +602,17 @@ class BoltPlacementForm(Form):
             MessageBox.Show("Invalid row spacing. Using default value of 0.0 (evenly spaced).", "Warning")
             self.row_spacing = 0.0
         
+        # Get checkbox value for using reversed curves
+        self.use_reversed_curves = self.chk_reversed.Checked
+        
         # Save preferences for next use
         save_preferences(
             self.family_type_name,
             self.spacing_values,
             self.offset_distance,
             self.num_rows,
-            self.row_spacing
+            self.row_spacing,
+            self.use_reversed_curves
         )
         
         self.DialogResult = DialogResult.OK
@@ -712,7 +766,8 @@ def main():
                 spacing_array,
                 offset_distance,
                 num_rows,
-                row_spacing
+                row_spacing,
+                form.use_reversed_curves
             )
             
             if instances:
