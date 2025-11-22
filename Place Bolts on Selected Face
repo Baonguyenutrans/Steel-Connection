@@ -1,0 +1,548 @@
+import clr
+import sys
+import math
+
+# Load standard IronPython libraries
+sys.path.append('C:\Program Files\IronPython 2.7\Lib')
+
+# Revit & .NET references
+clr.AddReference('RevitAPI')
+clr.AddReference('RevitAPIUI')
+clr.AddReference('System.Windows.Forms')
+clr.AddReference('System.Drawing')
+
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.UI import *
+from Autodesk.Revit.UI.Selection import *
+from System.Windows.Forms import MessageBox, Form, Label, TextBox, Button, FormStartPosition, DialogResult
+from System.Drawing import Point, Size, Color
+
+# Conversion factor: feet to internal units (feet already in Revit, but this helps)
+FEET_TO_INTERNAL = 1.0
+INCHES_TO_FEET = 1.0 / 12.0
+
+def feet_to_internal(feet):
+    """Convert feet to Revit internal units"""
+    return feet * FEET_TO_INTERNAL
+
+def get_sorted_curves(face):
+    """
+    Get perimeter curves from a face and sort them consistently.
+    Returns a list of curves sorted for consistent ordering.
+    """
+    edge_loops = face.GetEdgesAsCurveLoops()
+    if not edge_loops or len(edge_loops) == 0:
+        return []
+    
+    # Get the first (outer) edge loop
+    outer_loop = edge_loops[0]
+    curves = list(outer_loop)
+    
+    # Sort curves by their start point coordinates (for consistency)
+    def curve_key(crv):
+        start = crv.GetEndPoint(0)
+        return (start.X, start.Y, start.Z)
+    
+    sorted_curves = sorted(curves, key=curve_key)
+    return sorted_curves
+
+def get_point_at_parameter(curve, parameter):
+    """Get point at normalized parameter (0.0 to 1.0) along curve"""
+    return curve.Evaluate(parameter, True)
+
+def get_point_at_length(curve, length_from_start):
+    """
+    Get point at specified length from start of curve.
+    length_from_start is in feet (Revit internal units).
+    """
+    total_length = curve.Length
+    if total_length == 0:
+        return curve.GetEndPoint(0)
+    
+    # Calculate normalized parameter
+    param = length_from_start / total_length
+    param = max(0.0, min(1.0, param))  # Clamp between 0 and 1
+    
+    return curve.Evaluate(param, True)
+
+def get_reversed_curve(curve):
+    """Create a reversed copy of the curve"""
+    if isinstance(curve, Line):
+        start = curve.GetEndPoint(1)
+        end = curve.GetEndPoint(0)
+        return Line.CreateBound(start, end)
+    elif isinstance(curve, Arc):
+        # For Arc, reverse means swapping start/end angles
+        center = curve.Center
+        radius = curve.Radius
+        normal = curve.Normal
+        x_axis = curve.XDirection
+        
+        start_param = curve.GetEndParameter(1)
+        end_param = curve.GetEndParameter(0)
+        
+        return Arc.Create(center, radius, start_param, end_param, x_axis, normal)
+    else:
+        # For other curve types, create a reversed line approximation
+        start = curve.GetEndPoint(1)
+        end = curve.GetEndPoint(0)
+        return Line.CreateBound(start, end)
+
+def create_face_based_family_instance(doc, face_ref, location_point, family_type):
+    """
+    Create a face-based family instance on the given face reference.
+    
+    Args:
+        doc: Revit document
+        face_ref: Reference to the face
+        location_point: XYZ point for placement (projected onto face)
+        family_type: FamilySymbol for the bolt family
+    
+    Returns:
+        Created family instance or None
+    """
+    try:
+        # Activate the family type if needed
+        if not family_type.IsActive:
+            family_type.Activate()
+        
+        # Create the family instance using face reference
+        # For face-based families, NewFamilyInstance takes Reference, location, and FamilySymbol
+        instance = doc.Create.NewFamilyInstance(
+            face_ref,
+            location_point,
+            family_type
+        )
+        
+        return instance
+    except Exception as e:
+        # Try with orientation vector
+        try:
+            instance = doc.Create.NewFamilyInstance(
+                face_ref,
+                location_point,
+                XYZ.BasisZ,
+                family_type
+            )
+            return instance
+        except Exception as e2:
+            print("Error creating family instance: {}\nTried alternative: {}".format(str(e), str(e2)))
+            return None
+
+def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, offset_distance):
+    """
+    Place face-based bolts on a face based on the Dynamo logic.
+    
+    Args:
+        doc: Revit document
+        face: Selected face geometry
+        face_ref: Reference to the face
+        family_type_name: Name of the family type (e.g., "EAB_Face-Based_Bolt_D1")
+        spacing_array: List of spacing values in feet (converted from inches/12)
+        offset_distance: Offset distance in feet from curve start
+    
+    Returns:
+        List of created family instances
+    """
+    instances = []
+    
+    try:
+        # Get the family type
+        collector = FilteredElementCollector(doc)
+        family_symbols = collector.OfClass(FamilySymbol).WhereElementIsElementType()
+        
+        family_type = None
+        for fs in family_symbols:
+            try:
+                # Get family name and symbol name safely
+                family_name = ""
+                symbol_name = ""
+                
+                if fs.Family:
+                    family_name = fs.Family.Name if fs.Family.Name else ""
+                if hasattr(fs, 'Name') and fs.Name:
+                    symbol_name = fs.Name
+                
+                if not family_name and not symbol_name:
+                    continue
+                
+                # Try different matching patterns
+                full_name_1 = "{}_{}".format(family_name, symbol_name) if family_name and symbol_name else symbol_name
+                full_name_2 = "{}_Face-Based_Bolt_{}".format(family_name, symbol_name) if family_name and symbol_name else symbol_name
+                
+                # Check if family type name matches
+                search_name = family_type_name.lower()
+                if (search_name in full_name_1.lower() or 
+                    search_name in full_name_2.lower() or 
+                    symbol_name.lower() == search_name or
+                    search_name in symbol_name.lower() or
+                    search_name in family_name.lower()):
+                    family_type = fs
+                    break
+            except Exception as e:
+                # Skip this family symbol if there's an error accessing its properties
+                continue
+        
+        if family_type is None:
+            MessageBox.Show(
+                "Family type '{}' not found. Please ensure the family is loaded in the project.".format(family_type_name),
+                "Family Type Not Found"
+            )
+            return instances
+        
+        # Get face normal at center (UV parameter 0.5, 0.5)
+        try:
+            face_center_uv = UV(0.5, 0.5)
+            face_center = face.Evaluate(face_center_uv)
+            face_normal = face.ComputeNormal(face_center_uv)
+        except:
+            # Fallback: use face normal from first point
+            try:
+                edge_loops = face.GetEdgesAsCurveLoops()
+                if edge_loops and len(edge_loops) > 0:
+                    first_edge = edge_loops[0][0]
+                    face_center = first_edge.GetEndPoint(0)
+                    face_normal = face.FaceNormal
+                else:
+                    MessageBox.Show("Could not determine face center.", "Error")
+                    return instances
+            except:
+                MessageBox.Show("Could not evaluate face geometry.", "Error")
+                return instances
+        
+        # Get perimeter curves
+        sorted_curves = get_sorted_curves(face)
+        if len(sorted_curves) < 2:
+            MessageBox.Show("Face does not have enough perimeter curves.", "Invalid Face")
+            return instances
+        
+        # Sort curves for consistent ordering (like Dynamo's SortByFunction)
+        # Based on Dynamo code: t4 = a[0], t5 = a[1]
+        t4 = sorted_curves[0]  # First curve
+        t5 = sorted_curves[1]  # Second curve
+        
+        # Get points along curves at offset distance (t12 in Dynamo)
+        curves1 = t4
+        point1 = get_point_at_length(curves1, offset_distance)
+        
+        # Reverse second curve and get point
+        curve_rev_t5 = get_reversed_curve(t5)
+        curves2 = curve_rev_t5
+        point2 = get_point_at_length(curves2, offset_distance)
+        
+        # Create line between points (line1 in Dynamo)
+        line1 = Line.CreateBound(point1, point2)
+        
+        # Reverse first curve and get point
+        curve2 = get_reversed_curve(curves1)
+        point3 = get_point_at_length(curve2, offset_distance)
+        
+        # Reverse the reversed second curve (back to original direction)
+        curve3 = get_reversed_curve(curves2)
+        point4 = get_point_at_length(curve3, offset_distance)
+        
+        # Create second line (line2 in Dynamo)
+        line2 = Line.CreateBound(point3, point4)
+        
+        # Store reference lines (t13 = [line1, line2] in Dynamo)
+        reference_lines = [line1, line2]
+        
+        # Calculate bolt positions along the spacing array
+        # spacing_array contains cumulative or incremental distances (in feet)
+        # Based on Dynamo: spacing values are in inches/12, so already in feet
+        
+        # Place bolts along line1 at spacing intervals
+        line1_length = line1.Length
+        line1_dir = (line1.GetEndPoint(1) - line1.GetEndPoint(0)).Normalize()
+        
+        # Cumulative distance along the line
+        current_distance = 0.0
+        
+        for spacing in spacing_array:
+            if current_distance >= line1_length:
+                break  # Don't go beyond line length
+            
+            # Calculate position along line1
+            bolt_position = line1.GetEndPoint(0) + line1_dir * current_distance
+            
+            # Project point onto face to ensure it's on the surface
+            try:
+                # Try to project onto face using UV coordinates
+                # For now, use the point directly and let Revit handle face placement
+                instance = create_face_based_family_instance(
+                    doc, face_ref, bolt_position, family_type
+                )
+                if instance:
+                    instances.append(instance)
+            except Exception as e:
+                print("Error placing bolt at distance {}: {}".format(current_distance, str(e)))
+            
+            # Move to next position (add spacing)
+            current_distance += spacing
+        
+        return instances
+        
+    except Exception as e:
+        import traceback
+        error_msg = "Error placing bolts: {}\n\nTraceback:\n{}".format(str(e), traceback.format_exc())
+        MessageBox.Show(error_msg, "Error")
+        return instances
+
+class BoltPlacementForm(Form):
+    """Form for configuring bolt placement parameters"""
+    def __init__(self):
+        self.Text = "Place Face-Based Bolts"
+        self.Width = 450
+        self.Height = 350
+        self.StartPosition = FormStartPosition.CenterScreen
+        
+        self.family_type_name = "EAB_Face-Based_Bolt_D1"
+        self.spacing_values = "2, 5, 5, 5"
+        self.offset_distance = 2.0  # in feet
+        
+        # Family type label and input
+        lbl_family = Label()
+        lbl_family.Text = "Family Type Name:"
+        lbl_family.Location = Point(10, 15)
+        lbl_family.Size = Size(150, 20)
+        self.Controls.Add(lbl_family)
+        
+        self.txt_family = TextBox()
+        self.txt_family.Text = self.family_type_name
+        self.txt_family.Location = Point(10, 35)
+        self.txt_family.Size = Size(400, 22)
+        self.Controls.Add(self.txt_family)
+        
+        # Spacing values label and input
+        lbl_spacing = Label()
+        lbl_spacing.Text = "Spacing (inches, comma-separated):"
+        lbl_spacing.Location = Point(10, 70)
+        lbl_spacing.Size = Size(250, 20)
+        self.Controls.Add(lbl_spacing)
+        
+        self.txt_spacing = TextBox()
+        self.txt_spacing.Text = self.spacing_values
+        self.txt_spacing.Location = Point(10, 90)
+        self.txt_spacing.Size = Size(400, 22)
+        self.Controls.Add(self.txt_spacing)
+        
+        # Offset distance label and input
+        lbl_offset = Label()
+        lbl_offset.Text = "Offset from edge (feet):"
+        lbl_offset.Location = Point(10, 125)
+        lbl_offset.Size = Size(200, 20)
+        self.Controls.Add(lbl_offset)
+        
+        self.txt_offset = TextBox()
+        self.txt_offset.Text = str(self.offset_distance)
+        self.txt_offset.Location = Point(10, 145)
+        self.txt_offset.Size = Size(150, 22)
+        self.Controls.Add(self.txt_offset)
+        
+        # Info label
+        lbl_info = Label()
+        lbl_info.Text = "Note: Select a face in Revit after clicking OK"
+        lbl_info.Location = Point(10, 180)
+        lbl_info.Size = Size(400, 40)
+        lbl_info.ForeColor = Color.DarkGray
+        self.Controls.Add(lbl_info)
+        
+        # OK button
+        self.btn_ok = Button()
+        self.btn_ok.Text = "OK"
+        self.btn_ok.Location = Point(240, 240)
+        self.btn_ok.Size = Size(80, 30)
+        self.btn_ok.Click += self.on_ok
+        self.Controls.Add(self.btn_ok)
+        
+        # Cancel button
+        self.btn_cancel = Button()
+        self.btn_cancel.Text = "Cancel"
+        self.btn_cancel.Location = Point(330, 240)
+        self.btn_cancel.Size = Size(80, 30)
+        self.btn_cancel.Click += self.on_cancel
+        self.Controls.Add(self.btn_cancel)
+    
+    def on_ok(self, sender, args):
+        self.family_type_name = self.txt_family.Text.strip()
+        self.spacing_values = self.txt_spacing.Text.strip()
+        try:
+            self.offset_distance = float(self.txt_offset.Text)
+        except:
+            MessageBox.Show("Invalid offset distance. Using default value of 2.0 feet.", "Warning")
+            self.offset_distance = 2.0
+        self.DialogResult = DialogResult.OK
+        self.Close()
+    
+    def on_cancel(self, sender, args):
+        self.DialogResult = DialogResult.Cancel
+        self.Close()
+
+def parse_spacing_array(spacing_string):
+    """
+    Parse spacing string (comma-separated inches) and convert to feet.
+    Example: "2, 5, 5, 5" -> [2/12, 5/12, 5/12, 5/12]
+    """
+    try:
+        values = [float(x.strip()) for x in spacing_string.split(',')]
+        # Convert inches to feet
+        return [v * INCHES_TO_FEET for v in values]
+    except:
+        return [2.0 * INCHES_TO_FEET, 5.0 * INCHES_TO_FEET, 5.0 * INCHES_TO_FEET, 5.0 * INCHES_TO_FEET]
+
+def main():
+    """Main function to place face-based bolts"""
+    try:
+        # Get Revit application and document
+        uiapp = __revit__
+        app = uiapp.Application
+        doc = uiapp.ActiveUIDocument.Document
+        uidoc = uiapp.ActiveUIDocument
+        
+        # Show configuration form
+        form = BoltPlacementForm()
+        form.ShowDialog()
+        
+        if form.DialogResult != DialogResult.OK:
+            return
+        
+        # Parse spacing array
+        spacing_array = parse_spacing_array(form.spacing_values)
+        offset_distance = form.offset_distance
+        
+        # Prompt user to select a face
+        MessageBox.Show(
+            "Please select a face in the Revit view.\n\n" +
+            "Click on a face to place bolts.",
+            "Select Face"
+        )
+        
+        # Selection filter for faces
+        class FaceSelectionFilter(ISelectionFilter):
+            def AllowElement(self, element):
+                return True
+            
+            def AllowReference(self, reference, position):
+                return True
+        
+        try:
+            # Select face reference
+            face_ref = uidoc.Selection.PickObject(
+                ObjectType.Face,
+                FaceSelectionFilter(),
+                "Select a face to place bolts"
+            )
+            
+            # Get the face geometry from the reference
+            element = doc.GetElement(face_ref.ElementId)
+            
+            # Get geometry options
+            options = Options()
+            options.ComputeReferences = True
+            options.DetailLevel = ViewDetailLevel.Fine
+            options.IncludeNonVisibleObjects = False
+            
+            # Try to get face directly from reference (most reliable method)
+            face = None
+            try:
+                geometry_object = element.GetGeometryObjectFromReference(face_ref)
+                if isinstance(geometry_object, Face):
+                    face = geometry_object
+            except Exception as e:
+                print("Direct face extraction failed: {}".format(str(e)))
+            
+            # If direct method failed, search through geometry
+            # This is needed because sometimes the reference doesn't directly return the face
+            if face is None:
+                try:
+                    geo_elem = element.get_Geometry(options)
+                    if geo_elem:
+                        for obj in geo_elem:
+                            if isinstance(obj, GeometryInstance):
+                                # Get transformed geometry
+                                transform = obj.Transform
+                                instance_geo = obj.GetInstanceGeometry()
+                                if instance_geo:
+                                    for geom_obj in instance_geo:
+                                        if isinstance(geom_obj, Solid):
+                                            for face_obj in geom_obj.Faces:
+                                                try:
+                                                    # Check if this face matches our reference
+                                                    if face_obj.Reference:
+                                                        if (face_obj.Reference.ElementId == face_ref.ElementId and
+                                                            hasattr(face_ref, 'LinkElementId') == hasattr(face_obj.Reference, 'LinkElementId')):
+                                                            face = face_obj
+                                                            break
+                                                except:
+                                                    pass
+                                        if face:
+                                            break
+                                    if face:
+                                        break
+                            elif isinstance(obj, Solid):
+                                for face_obj in obj.Faces:
+                                    try:
+                                        if face_obj.Reference:
+                                            if (face_obj.Reference.ElementId == face_ref.ElementId and
+                                                hasattr(face_ref, 'LinkElementId') == hasattr(face_obj.Reference, 'LinkElementId')):
+                                                face = face_obj
+                                                break
+                                    except:
+                                        pass
+                                if face:
+                                    break
+                            if face:
+                                break
+                except Exception as e:
+                    print("Error searching geometry: {}".format(str(e)))
+            
+            if face is None:
+                MessageBox.Show(
+                    "Could not extract face geometry from reference.\n" +
+                    "Please try selecting a different face or ensure the element has visible faces.",
+                    "Face Extraction Error"
+                )
+                return
+            
+            # Start transaction
+            t = Transaction(doc, "Place Face-Based Bolts")
+            t.Start()
+            
+            # Place bolts
+            instances = place_bolts_on_face(
+                doc,
+                face,
+                face_ref,
+                form.family_type_name,
+                spacing_array,
+                offset_distance
+            )
+            
+            if instances:
+                t.Commit()
+                MessageBox.Show(
+                    "Successfully placed {} bolt(s) on the selected face.".format(len(instances)),
+                    "Success"
+                )
+            else:
+                t.RollBack()
+                MessageBox.Show(
+                    "No bolts were placed. Please check the family type name and face selection.",
+                    "No Bolts Placed"
+                )
+                
+        except Exception as e:
+            if 'operation was cancelled' in str(e).lower() or 'cancelled' in str(e).lower():
+                pass  # User cancelled selection
+            else:
+                MessageBox.Show(
+                    "Error during face selection: {}\n\nPlease ensure you select a valid face.".format(str(e)),
+                    "Selection Error"
+                )
+    
+    except Exception as e:
+        MessageBox.Show("Unexpected error: {}".format(str(e)), "Error")
+
+if __name__ == '__main__':
+    main()
+
