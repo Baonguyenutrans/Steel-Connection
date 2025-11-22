@@ -1,9 +1,20 @@
 import clr
 import sys
 import math
+import os
 
 # Load standard IronPython libraries
 sys.path.append('C:\Program Files\IronPython 2.7\Lib')
+
+# Try to import json module (may not be available in IronPython 2.7)
+try:
+    import json
+except ImportError:
+    try:
+        import simplejson as json
+    except ImportError:
+        # If json is not available, we'll use a simple text-based format
+        json = None
 
 # Revit & .NET references
 clr.AddReference('RevitAPI')
@@ -25,10 +36,17 @@ def feet_to_internal(feet):
     """Convert feet to Revit internal units"""
     return feet * FEET_TO_INTERNAL
 
-def get_sorted_curves(face):
+def get_sorted_curves(face, sort_by_length=False):
     """
-    Get perimeter curves from a face and sort them consistently.
-    Returns a list of curves sorted for consistent ordering.
+    Get perimeter curves from a face and sort them.
+    
+    Args:
+        face: Face geometry
+        sort_by_length: If True, sort by curve length (shortest first).
+                       If False, sort by start point coordinates.
+    
+    Returns:
+        List of curves sorted according to sort_by_length parameter.
     """
     edge_loops = face.GetEdgesAsCurveLoops()
     if not edge_loops or len(edge_loops) == 0:
@@ -38,12 +56,18 @@ def get_sorted_curves(face):
     outer_loop = edge_loops[0]
     curves = list(outer_loop)
     
-    # Sort curves by their start point coordinates (for consistency)
-    def curve_key(crv):
-        start = crv.GetEndPoint(0)
-        return (start.X, start.Y, start.Z)
+    if sort_by_length:
+        # Sort curves by their length (shortest first)
+        def curve_key(crv):
+            return crv.Length
+        sorted_curves = sorted(curves, key=curve_key)
+    else:
+        # Sort curves by their start point coordinates (for consistency)
+        def curve_key(crv):
+            start = crv.GetEndPoint(0)
+            return (start.X, start.Y, start.Z)
+        sorted_curves = sorted(curves, key=curve_key)
     
-    sorted_curves = sorted(curves, key=curve_key)
     return sorted_curves
 
 def get_point_at_parameter(curve, parameter):
@@ -129,7 +153,7 @@ def create_face_based_family_instance(doc, face_ref, location_point, family_type
             print("Error creating family instance: {}\nTried alternative: {}".format(str(e), str(e2)))
             return None
 
-def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, offset_distance):
+def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, offset_distance, num_rows=1, row_spacing=0.0):
     """
     Place face-based bolts on a face based on the Dynamo logic.
     
@@ -140,6 +164,8 @@ def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, of
         family_type_name: Name of the family type (e.g., "EAB_Face-Based_Bolt_D1")
         spacing_array: List of spacing values in feet (converted from inches/12)
         offset_distance: Offset distance in feet from curve start
+        num_rows: Number of rows of bolts to place (default: 1)
+        row_spacing: Spacing between rows in feet (default: 0.0, uses distance between line1 and line2)
     
     Returns:
         List of created family instances
@@ -211,24 +237,27 @@ def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, of
                 return instances
         
         # Get perimeter curves
-        sorted_curves = get_sorted_curves(face)
+        # Sort by length to get shortest edges first (typically the width edges for rectangular faces)
+        sorted_curves = get_sorted_curves(face, sort_by_length=True)
         if len(sorted_curves) < 2:
             MessageBox.Show("Face does not have enough perimeter curves.", "Invalid Face")
             return instances
         
-        # Sort curves for consistent ordering (like Dynamo's SortByFunction)
+        # Select the two shortest edges for point calculation
+        # After sorting by length, first two curves are the shortest edges
         # Based on Dynamo code: t4 = a[0], t5 = a[1]
-        t4 = sorted_curves[0]  # First curve
-        t5 = sorted_curves[1]  # Second curve
+        t4 = sorted_curves[0]  # Shortest edge
+        t5 = sorted_curves[1]  # Second shortest edge
         
-        # Get points along curves at offset distance (t12 in Dynamo)
-        curves1 = t4
-        point1 = get_point_at_length(curves1, offset_distance)
+        # Get points at specified length along the SHORTEST edges (t12 in Dynamo)
+        # These points will be on the shortest edges
+        curves1 = t4  # Shortest edge
+        point1 = get_point_at_length(curves1, offset_distance)  # Point on shortest edge
         
-        # Reverse second curve and get point
-        curve_rev_t5 = get_reversed_curve(t5)
+        # Use second shortest edge (or parallel shortest edge for rectangles)
+        curve_rev_t5 = get_reversed_curve(t5)  # Reverse the second shortest edge
         curves2 = curve_rev_t5
-        point2 = get_point_at_length(curves2, offset_distance)
+        point2 = get_point_at_length(curves2, offset_distance)  # Point on second shortest edge
         
         # Create line between points (line1 in Dynamo)
         line1 = Line.CreateBound(point1, point2)
@@ -251,34 +280,80 @@ def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, of
         # spacing_array contains cumulative or incremental distances (in feet)
         # Based on Dynamo: spacing values are in inches/12, so already in feet
         
-        # Place bolts along line1 at spacing intervals
-        line1_length = line1.Length
-        line1_dir = (line1.GetEndPoint(1) - line1.GetEndPoint(0)).Normalize()
+        # Calculate row lines based on number of rows
+        row_lines = []
+        line1_start = line1.GetEndPoint(0)
+        line1_end = line1.GetEndPoint(1)
+        line2_start = line2.GetEndPoint(0)
+        line2_end = line2.GetEndPoint(1)
         
-        # Cumulative distance along the line
-        current_distance = 0.0
+        # Calculate direction vector from line1 to line2
+        row_dir_start = (line2_start - line1_start).Normalize() if (line2_start - line1_start).GetLength() > 0.001 else XYZ.BasisX
+        row_dir_end = (line2_end - line1_end).Normalize() if (line2_end - line1_end).GetLength() > 0.001 else XYZ.BasisX
         
-        for spacing in spacing_array:
-            if current_distance >= line1_length:
-                break  # Don't go beyond line length
+        # Calculate total distance between line1 and line2
+        total_distance = (line2_start - line1_start).GetLength()
+        
+        if num_rows <= 1:
+            # Single row: use line1 only
+            row_lines = [line1]
+        elif num_rows == 2:
+            # Two rows: use line1 and line2
+            row_lines = [line1, line2]
+        else:
+            # Multiple rows: create rows between line1 and line2
+            if row_spacing > 0.0 and total_distance > 0.001:
+                # Use specified row spacing (in feet)
+                for i in range(num_rows):
+                    # Calculate distance from line1
+                    distance_from_line1 = i * row_spacing
+                    if distance_from_line1 > total_distance:
+                        break  # Don't go beyond line2
+                    
+                    # Interpolate position between line1 and line2
+                    t = distance_from_line1 / total_distance if total_distance > 0.001 else 0.0
+                    t = min(1.0, t)  # Clamp to 1.0
+                    
+                    start_point = line1_start + row_dir_start * distance_from_line1
+                    end_point = line1_end + row_dir_end * distance_from_line1
+                    row_line = Line.CreateBound(start_point, end_point)
+                    row_lines.append(row_line)
+            else:
+                # Distribute evenly between line1 and line2
+                for i in range(num_rows):
+                    t = float(i) / (num_rows - 1) if num_rows > 1 else 0.0
+                    start_point = line1_start + (line2_start - line1_start) * t
+                    end_point = line1_end + (line2_end - line1_end) * t
+                    row_line = Line.CreateBound(start_point, end_point)
+                    row_lines.append(row_line)
+        
+        # Place bolts along each row
+        for row_line in row_lines:
+            line_length = row_line.Length
+            line_dir = (row_line.GetEndPoint(1) - row_line.GetEndPoint(0)).Normalize()
             
-            # Calculate position along line1
-            bolt_position = line1.GetEndPoint(0) + line1_dir * current_distance
+            # Cumulative distance along the line
+            current_distance = 0.0
             
-            # Project point onto face to ensure it's on the surface
-            try:
-                # Try to project onto face using UV coordinates
-                # For now, use the point directly and let Revit handle face placement
-                instance = create_face_based_family_instance(
-                    doc, face_ref, bolt_position, family_type
-                )
-                if instance:
-                    instances.append(instance)
-            except Exception as e:
-                print("Error placing bolt at distance {}: {}".format(current_distance, str(e)))
-            
-            # Move to next position (add spacing)
-            current_distance += spacing
+            for spacing in spacing_array:
+                if current_distance >= line_length:
+                    break  # Don't go beyond line length
+                
+                # Calculate position along the row line
+                bolt_position = row_line.GetEndPoint(0) + line_dir * current_distance
+                
+                # Project point onto face to ensure it's on the surface
+                try:
+                    instance = create_face_based_family_instance(
+                        doc, face_ref, bolt_position, family_type
+                    )
+                    if instance:
+                        instances.append(instance)
+                except Exception as e:
+                    print("Error placing bolt at distance {}: {}".format(current_distance, str(e)))
+                
+                # Move to next position (add spacing)
+                current_distance += spacing
         
         return instances
         
@@ -288,17 +363,77 @@ def place_bolts_on_face(doc, face, face_ref, family_type_name, spacing_array, of
         MessageBox.Show(error_msg, "Error")
         return instances
 
+def get_preferences_file_path():
+    """Get the path to the preferences JSON file"""
+    try:
+        # Try to save in user's home directory
+        home = os.path.expanduser('~')
+        prefs_dir = os.path.join(home, 'pyRebar')
+        if not os.path.exists(prefs_dir):
+            os.makedirs(prefs_dir)
+        return os.path.join(prefs_dir, 'bolt_placement_preferences.json')
+    except:
+        # Fallback: save next to the script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(script_dir, 'bolt_placement_preferences.json')
+
+def load_preferences():
+    """Load preferences from JSON file"""
+    if json is None:
+        return None
+    
+    try:
+        prefs_path = get_preferences_file_path()
+        if os.path.isfile(prefs_path):
+            with open(prefs_path, 'r') as f:
+                prefs = json.load(f)
+                return prefs
+    except Exception as e:
+        print("Error loading preferences: {}".format(str(e)))
+    return None
+
+def save_preferences(family_type_name, spacing_values, offset_distance, num_rows, row_spacing):
+    """Save preferences to JSON file"""
+    if json is None:
+        return  # Skip saving if json is not available
+    
+    try:
+        prefs = {
+            'family_type_name': family_type_name,
+            'spacing_values': spacing_values,
+            'offset_distance': offset_distance,
+            'num_rows': num_rows,
+            'row_spacing': row_spacing
+        }
+        prefs_path = get_preferences_file_path()
+        with open(prefs_path, 'w') as f:
+            json.dump(prefs, f, indent=4)
+    except Exception as e:
+        print("Error saving preferences: {}".format(str(e)))
+
 class BoltPlacementForm(Form):
     """Form for configuring bolt placement parameters"""
     def __init__(self):
         self.Text = "Place Face-Based Bolts"
         self.Width = 450
-        self.Height = 350
+        self.Height = 450  # Increased height for new fields
         self.StartPosition = FormStartPosition.CenterScreen
         
-        self.family_type_name = "EAB_Face-Based_Bolt_D1"
-        self.spacing_values = "2, 5, 5, 5"
-        self.offset_distance = 2.0  # in feet
+        # Load previous preferences or use defaults
+        prefs = load_preferences()
+        if prefs:
+            self.family_type_name = prefs.get('family_type_name', "EAB_Face-Based_Bolt_D1")
+            self.spacing_values = prefs.get('spacing_values', "2, 5, 5, 5")
+            self.offset_distance = prefs.get('offset_distance', 0.0)
+            self.num_rows = prefs.get('num_rows', 1)
+            self.row_spacing = prefs.get('row_spacing', 0.0)
+        else:
+            # Default values
+            self.family_type_name = "EAB_Face-Based_Bolt_D1"
+            self.spacing_values = "2, 5, 5, 5"
+            self.offset_distance = 0.0  # in inches
+            self.num_rows = 1  # Number of rows
+            self.row_spacing = 0.0  # Row spacing in inches (0 = auto/evenly spaced)
         
         # Family type label and input
         lbl_family = Label()
@@ -328,7 +463,7 @@ class BoltPlacementForm(Form):
         
         # Offset distance label and input
         lbl_offset = Label()
-        lbl_offset.Text = "Offset from edge (feet):"
+        lbl_offset.Text = "Offset from edge (inches):"
         lbl_offset.Location = Point(10, 125)
         lbl_offset.Size = Size(200, 20)
         self.Controls.Add(lbl_offset)
@@ -339,10 +474,36 @@ class BoltPlacementForm(Form):
         self.txt_offset.Size = Size(150, 22)
         self.Controls.Add(self.txt_offset)
         
+        # Number of rows label and input
+        lbl_rows = Label()
+        lbl_rows.Text = "Number of rows:"
+        lbl_rows.Location = Point(10, 175)
+        lbl_rows.Size = Size(200, 20)
+        self.Controls.Add(lbl_rows)
+        
+        self.txt_rows = TextBox()
+        self.txt_rows.Text = str(self.num_rows)
+        self.txt_rows.Location = Point(10, 195)
+        self.txt_rows.Size = Size(150, 22)
+        self.Controls.Add(self.txt_rows)
+        
+        # Row spacing label and input
+        lbl_row_spacing = Label()
+        lbl_row_spacing.Text = "Row spacing (inches, 0=evenly):"
+        lbl_row_spacing.Location = Point(10, 225)
+        lbl_row_spacing.Size = Size(250, 20)
+        self.Controls.Add(lbl_row_spacing)
+        
+        self.txt_row_spacing = TextBox()
+        self.txt_row_spacing.Text = str(self.row_spacing)
+        self.txt_row_spacing.Location = Point(10, 245)
+        self.txt_row_spacing.Size = Size(150, 22)
+        self.Controls.Add(self.txt_row_spacing)
+        
         # Info label
         lbl_info = Label()
         lbl_info.Text = "Note: Select a face in Revit after clicking OK"
-        lbl_info.Location = Point(10, 180)
+        lbl_info.Location = Point(10, 275)
         lbl_info.Size = Size(400, 40)
         lbl_info.ForeColor = Color.DarkGray
         self.Controls.Add(lbl_info)
@@ -350,7 +511,7 @@ class BoltPlacementForm(Form):
         # OK button
         self.btn_ok = Button()
         self.btn_ok.Text = "OK"
-        self.btn_ok.Location = Point(240, 240)
+        self.btn_ok.Location = Point(240, 340)
         self.btn_ok.Size = Size(80, 30)
         self.btn_ok.Click += self.on_ok
         self.Controls.Add(self.btn_ok)
@@ -358,7 +519,7 @@ class BoltPlacementForm(Form):
         # Cancel button
         self.btn_cancel = Button()
         self.btn_cancel.Text = "Cancel"
-        self.btn_cancel.Location = Point(330, 240)
+        self.btn_cancel.Location = Point(330, 340)
         self.btn_cancel.Size = Size(80, 30)
         self.btn_cancel.Click += self.on_cancel
         self.Controls.Add(self.btn_cancel)
@@ -367,10 +528,39 @@ class BoltPlacementForm(Form):
         self.family_type_name = self.txt_family.Text.strip()
         self.spacing_values = self.txt_spacing.Text.strip()
         try:
+            # Input is in inches, store as inches
             self.offset_distance = float(self.txt_offset.Text)
         except:
-            MessageBox.Show("Invalid offset distance. Using default value of 2.0 feet.", "Warning")
-            self.offset_distance = 2.0
+            MessageBox.Show("Invalid offset distance. Using default value of 0.0 inches.", "Warning")
+            self.offset_distance = 0.0
+        
+        try:
+            # Number of rows (must be at least 1)
+            self.num_rows = int(self.txt_rows.Text)
+            if self.num_rows < 1:
+                self.num_rows = 1
+        except:
+            MessageBox.Show("Invalid number of rows. Using default value of 1.", "Warning")
+            self.num_rows = 1
+        
+        try:
+            # Row spacing in inches (0 = auto/evenly spaced)
+            self.row_spacing = float(self.txt_row_spacing.Text)
+            if self.row_spacing < 0:
+                self.row_spacing = 0.0
+        except:
+            MessageBox.Show("Invalid row spacing. Using default value of 0.0 (evenly spaced).", "Warning")
+            self.row_spacing = 0.0
+        
+        # Save preferences for next use
+        save_preferences(
+            self.family_type_name,
+            self.spacing_values,
+            self.offset_distance,
+            self.num_rows,
+            self.row_spacing
+        )
+        
         self.DialogResult = DialogResult.OK
         self.Close()
     
@@ -406,9 +596,14 @@ def main():
         if form.DialogResult != DialogResult.OK:
             return
         
-        # Parse spacing array
+        # Parse spacing array (converts inches to feet)
         spacing_array = parse_spacing_array(form.spacing_values)
-        offset_distance = form.offset_distance
+        # Convert offset from inches to feet
+        offset_distance = form.offset_distance * INCHES_TO_FEET
+        # Get number of rows and row spacing
+        num_rows = form.num_rows
+        # Convert row spacing from inches to feet (0 = auto/evenly spaced)
+        row_spacing = form.row_spacing * INCHES_TO_FEET if form.row_spacing > 0 else 0.0
         
         # Prompt user to select a face
         MessageBox.Show(
@@ -515,7 +710,9 @@ def main():
                 face_ref,
                 form.family_type_name,
                 spacing_array,
-                offset_distance
+                offset_distance,
+                num_rows,
+                row_spacing
             )
             
             if instances:
